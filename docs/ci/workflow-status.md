@@ -35,7 +35,7 @@
 
 | Workflow | Disabled where | Last direct run |
 |---|---|---|
-| `nuclei.yml` | `release-gate.yml:189` (commented) | never |
+| `nuclei.yml` | `release-gate.yml:195` (commented) | never |
 
 ## ⚠ Stale (scheduled but no recent successful run)
 
