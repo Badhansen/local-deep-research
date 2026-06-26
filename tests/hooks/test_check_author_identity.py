@@ -1,7 +1,7 @@
 """Tests for the check-author-identity pre-commit hook.
 
-All test data uses throwaway addresses (``*.test`` / ``example.com``); no real
-contributor email appears in this file.
+All test data uses throwaway addresses (``*.test`` / ``example.com``) or public
+GitHub noreply addresses; no real personal email appears in this file.
 """
 
 import importlib.util
@@ -20,104 +20,144 @@ mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
 
-# Declared identities used across tests (mirrors the pyproject shape).
+PYPROJECT = """\
+[project]
+name = "x"
+authors = [
+    {name = "LearningCircuit", email = "185559241+LearningCircuit@users.noreply.github.com"},
+    {name = "djpetti", email = "djpetti@example.com"},
+]
+"""
 DECLARED = {
-    "LearningCircuit": {"185559241+learningcircuit@users.noreply.github.com"},
+    "learningcircuit": {"185559241+learningcircuit@users.noreply.github.com"},
     "djpetti": {"djpetti@example.com"},
 }
 
 
-class TestLoadDeclaredIdentities:
-    def test_parses_authors_block(self, tmp_path, monkeypatch):
-        (tmp_path / "pyproject.toml").write_text(
+class TestParseIdentities:
+    def test_parses_and_lowercases(self):
+        assert mod.parse_identities(PYPROJECT) == DECLARED
+
+    def test_key_order_independent(self):
+        text = (
+            'authors = [\n    {email = "bob@example.com", name = "Bob"},\n]\n'
+        )
+        assert mod.parse_identities(text) == {"bob": {"bob@example.com"}}
+
+    def test_anchored_ignores_other_authors_keys(self):
+        text = (
+            'co_authors = ["x"]\n'
+            'authors = [\n    {name = "A", email = "a@b.test"},\n]\n'
+        )
+        assert mod.parse_identities(text) == {"a": {"a@b.test"}}
+
+    def test_no_block_returns_empty(self):
+        assert mod.parse_identities('[project]\nname = "x"\n') == {}
+
+    def test_multiple_emails_per_name(self):
+        text = (
             "authors = [\n"
-            '    {name = "Alice", email = "1+Alice@users.noreply.github.com"},\n'
-            '    {name = "Bob", email = "bob@example.com"},\n'
+            '    {name = "A", email = "a@x.test"},\n'
+            '    {name = "A", email = "a2@x.test"},\n'
             "]\n"
         )
-        monkeypatch.chdir(tmp_path)
-        assert mod.load_declared_identities() == {
-            "Alice": {"1+alice@users.noreply.github.com"},  # lower-cased
-            "Bob": {"bob@example.com"},
-        }
+        assert mod.parse_identities(text) == {"a": {"a@x.test", "a2@x.test"}}
 
-    def test_missing_pyproject_returns_empty(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        assert mod.load_declared_identities() == {}
 
-    def test_no_authors_block_returns_empty(self, tmp_path, monkeypatch):
-        (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\n')
-        monkeypatch.chdir(tmp_path)
-        assert mod.load_declared_identities() == {}
+class TestIsNoreply:
+    def test_user_noreply_allowed(self):
+        assert mod._is_noreply("123+user@users.noreply.github.com")
+        assert mod._is_noreply("user@users.noreply.github.com")
+
+    def test_personal_and_webflow_not_user_noreply(self):
+        assert not mod._is_noreply("user@example.com")
+        assert not mod._is_noreply("noreply@github.com")  # web-flow committer
 
 
 class TestMismatch:
-    def test_declared_name_declared_email_ok_case_insensitive(self):
+    def test_any_noreply_allowed_for_declared_author(self):
+        # djpetti is declared with a non-noreply email; his GH noreply must pass.
         assert (
             mod._mismatch(
                 "author",
-                "LearningCircuit",
-                "185559241+LearningCircuit@users.noreply.github.com",
+                "djpetti",
+                "7475340+djpetti@users.noreply.github.com",
                 DECLARED,
             )
             is None
         )
 
-    def test_declared_name_foreign_email_flagged(self):
+    def test_declared_email_allowed(self):
+        assert (
+            mod._mismatch("author", "djpetti", "djpetti@example.com", DECLARED)
+            is None
+        )
+
+    def test_declared_author_personal_email_flagged(self):
         msg = mod._mismatch(
-            "author", "LearningCircuit", "foreign@nope.test", DECLARED
+            "author", "LearningCircuit", "personal@nope.test", DECLARED
         )
         assert msg is not None
         assert "LearningCircuit" in msg
 
-    def test_violation_message_never_contains_offending_email(self):
+    def test_case_insensitive_name_match(self):
+        # A lowercase display name must still be enforced (the hashedviking gap).
+        assert (
+            mod._mismatch(
+                "author", "learningcircuit", "personal@nope.test", DECLARED
+            )
+            is not None
+        )
+
+    def test_unknown_name_not_enforced(self):
+        assert (
+            mod._mismatch("author", "Outsider", "out@example.com", DECLARED)
+            is None
+        )
+
+    def test_message_never_contains_offending_email(self):
         secret = "do-not-leak@secret.test"
         msg = mod._mismatch("author", "LearningCircuit", secret, DECLARED)
         assert msg is not None
         assert secret not in msg
         assert "secret" not in msg.lower()
 
-    def test_unknown_name_not_flagged(self):
-        assert (
-            mod._mismatch("author", "RandomDev", "rd@example.com", DECLARED)
-            is None
-        )
-
-    def test_declared_author_with_own_email_ok(self):
-        assert (
-            mod._mismatch("author", "djpetti", "djpetti@example.com", DECLARED)
-            is None
-        )
-
-    def test_whitespace_and_case_tolerant(self):
-        assert (
-            mod._mismatch(
-                "author",
-                "  LearningCircuit  ",
-                "  185559241+LEARNINGCIRCUIT@users.noreply.github.com  ",
-                DECLARED,
-            )
-            is None
-        )
-
     def test_empty_declared_never_flags(self):
-        assert mod._mismatch("author", "Anyone", "any@x.test", {}) is None
+        assert mod._mismatch("author", "Anyone", "x@y.test", {}) is None
 
 
 class TestCoAuthorRegex:
     def test_matches_trailer(self):
-        m = mod._CO_AUTHOR.search(
-            "body\n\nCo-authored-by: Some One <a@b.test>\n"
-        )
+        m = mod._CO_AUTHOR.search("b\n\nCo-authored-by: Some One <a@b.test>\n")
         assert m is not None
         assert m.group("name") == "Some One"
         assert m.group("email") == "a@b.test"
 
-    def test_case_insensitive(self):
-        assert mod._CO_AUTHOR.search("co-authored-by: X <x@y.test>") is not None
+    def test_indented_trailer_matches(self):
+        assert (
+            mod._CO_AUTHOR.search("  Co-authored-by: X <x@y.test>") is not None
+        )
 
     def test_no_false_match_on_prose(self):
         assert mod._CO_AUTHOR.search("This was co-authored by someone") is None
+
+
+class TestParseLog:
+    def test_basic_record(self):
+        raw = "sha1\x00An\x00ae@x.test\x00Cn\x00ce@x.test\x00body line\x1e"
+        assert mod._parse_log(raw) == [
+            ("sha1", "An", "ae@x.test", "Cn", "ce@x.test", "body line")
+        ]
+
+    def test_nul_in_body_is_preserved(self):
+        # A NUL earlier in the body must not truncate it: a real trailer (on its
+        # own line) after the NUL must survive and still be detected.
+        body = "head\x00more\n\nCo-authored-by: LearningCircuit <bad@nope.test>"
+        raw = f"sha1\x00An\x00a@x.test\x00Cn\x00c@x.test\x00{body}\x1e"
+        recs = mod._parse_log(raw)
+        assert recs[0][5] == body  # full body kept (old fields[5] would truncate)
+        errs = mod._check(recs[0], DECLARED)
+        assert any("Co-authored-by" in e for e in errs)
 
 
 class TestCheck:
@@ -131,7 +171,7 @@ class TestCheck:
         )
         assert len(errs) == 1
         assert "author" in errs[0]
-        assert "deadbeef0" in errs[0]  # short sha included
+        assert "deadbeef0" in errs[0]
 
     def test_committer_violation(self):
         errs = mod._check(
@@ -143,14 +183,14 @@ class TestCheck:
     def test_co_author_trailer_violation(self):
         errs = mod._check(
             self._rec(
-                body="msg\n\nCo-authored-by: LearningCircuit <bad@nope.test>\n"
+                body="m\n\nCo-authored-by: LearningCircuit <bad@nope.test>\n"
             ),
             DECLARED,
         )
         assert len(errs) == 1
         assert "Co-authored-by" in errs[0]
 
-    def test_clean_record_passes(self):
+    def test_clean_noreply_passes(self):
         good = "185559241+learningcircuit@users.noreply.github.com"
         errs = mod._check(
             self._rec(
@@ -161,10 +201,10 @@ class TestCheck:
         assert errs == []
 
     def test_external_contributor_passes(self):
-        errs = mod._check(
-            self._rec(an="Outsider", ae="out@example.com"), DECLARED
+        assert (
+            mod._check(self._rec(an="Outsider", ae="out@example.com"), DECLARED)
+            == []
         )
-        assert errs == []
 
     def test_no_offending_email_in_any_message(self):
         secret = "leak-me@secret.test"

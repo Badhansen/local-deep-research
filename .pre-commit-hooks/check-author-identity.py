@@ -2,20 +2,25 @@
 """Author identity consistency check.
 
 Ensures every commit attributed to a project author declared in
-``pyproject.toml`` (the ``authors`` list) uses that author's declared email
-identity, keeping contributor attribution consistent across history.
+``pyproject.toml`` (the ``authors`` list) uses an acceptable email identity:
+either a GitHub ``@users.noreply.github.com`` address (always allowed — these
+are privacy-preserving), or that author's own declared address. This keeps
+contributor attribution consistent and prevents a declared author's commits
+from going out under an unintended personal address.
 
 It inspects commit *metadata* (author, committer, and ``Co-authored-by``
 trailers) rather than file contents, so it runs once per invocation
 (``always_run: true`` / ``pass_filenames: false``):
 
-- In CI on a pull request, it checks every commit the PR adds.
+- In CI on a pull request, it checks every commit the PR adds (``merge-base..head``),
+  and reads the allow-list from the *base* ref so a PR cannot authorize an
+  address by editing ``pyproject.toml`` in the same change.
 - Locally at the pre-commit stage, it checks the commit about to be made.
 
-The allowed identities are read from ``pyproject.toml`` at runtime — nothing
-is hard-coded here. A mismatching address is never printed (so it can't end
-up in logs); the message only names the declared author and its expected
-identity.
+The allow-list is read from ``pyproject.toml`` at runtime — nothing is
+hard-coded here. A mismatching address is never printed (so it can't end up in
+logs); messages name only the declared author. Range-resolution failures fail
+*closed* (the check fails rather than silently passing).
 """
 
 from __future__ import annotations
@@ -27,48 +32,62 @@ import subprocess
 import sys
 from pathlib import Path
 
-
-def git(*args: str) -> str:
-    return subprocess.run(["git", *args], capture_output=True, text=True).stdout
+NOREPLY_SUFFIX = "@users.noreply.github.com"
 
 
-def load_declared_identities() -> dict[str, set[str]]:
-    """Map declared author name -> set of allowed (lower-cased) emails."""
-    try:
-        text = Path("pyproject.toml").read_text(encoding="utf-8")
-    except OSError:
-        return {}
-    block = re.search(r"authors\s*=\s*\[(.*?)\]", text, re.S)
+def _git(*args: str) -> tuple[int, str]:
+    """Run git; return (returncode, stdout). stderr is captured and discarded."""
+    proc = subprocess.run(["git", *args], capture_output=True, text=True)
+    return proc.returncode, proc.stdout
+
+
+def parse_identities(text: str) -> dict[str, set[str]]:
+    """Map declared author name (lower-cased) -> set of declared emails (lower).
+
+    Tolerant of key order and surrounding whitespace; anchored to a top-level
+    ``authors = [`` line so an unrelated ``*authors`` key can't hijack it.
+    """
     identities: dict[str, set[str]] = {}
-    if block:
-        for name, email in re.findall(
-            r'name\s*=\s*"([^"]+)"\s*,\s*email\s*=\s*"([^"]+)"', block.group(1)
-        ):
-            identities.setdefault(name.strip(), set()).add(
-                email.strip().lower()
+    block = re.search(r"(?m)^authors\s*=\s*\[(.*?)\]", text, re.S)
+    if not block:
+        return identities
+    for entry in re.findall(r"\{([^}]*)\}", block.group(1)):
+        name = re.search(r'name\s*=\s*"([^"]+)"', entry)
+        email = re.search(r'email\s*=\s*"([^"]+)"', entry)
+        if name and email:
+            identities.setdefault(name.group(1).strip().lower(), set()).add(
+                email.group(1).strip().lower()
             )
     return identities
 
 
+def _is_noreply(email: str) -> bool:
+    return email.endswith(NOREPLY_SUFFIX)
+
+
 def _mismatch(kind: str, name: str, email: str, declared: dict[str, set[str]]):
-    """Return a message if (name, email) contradicts a declared identity.
+    """Return a message if (name, email) is a disallowed identity, else None.
 
     The offending email is intentionally NOT included in the message.
     """
-    name = (name or "").strip()
+    raw_name = (name or "").strip()
+    key = raw_name.lower()
     email = (email or "").strip().lower()
-    allowed = declared.get(name)
-    if allowed and email not in allowed:
-        expected = ", ".join(sorted(allowed))
-        return (
-            f'{kind} "{name}" is a declared author but is not using its '
-            f"declared identity (expected: {expected})"
-        )
-    return None
+    allowed = declared.get(key)
+    if not allowed:
+        return None  # not a declared author -> not enforced
+    if _is_noreply(email):
+        return None  # any GitHub noreply is privacy-safe and allowed
+    if email in allowed:
+        return None  # the author's own declared address
+    return (
+        f'{kind} "{raw_name}" is a declared author but is using a non-noreply '
+        f"address that is not its declared identity"
+    )
 
 
 _CO_AUTHOR = re.compile(
-    r"^Co-authored-by:\s*(?P<name>.*?)\s*<(?P<email>[^>]+)>\s*$", re.I | re.M
+    r"^\s*Co-authored-by:\s*(?P<name>.*?)\s*<(?P<email>[^>]+)>\s*$", re.I | re.M
 )
 
 
@@ -88,8 +107,54 @@ def _check(record, declared) -> list[str]:
     return out
 
 
-def _pr_range_records():
-    """Records for the commits a pull request adds, or None if not in PR CI."""
+def _parse_log(raw: str) -> list[tuple]:
+    records = []
+    for chunk in raw.split("\x1e"):
+        chunk = chunk.strip("\n")
+        if not chunk:
+            continue
+        fields = chunk.split("\x00")
+        if len(fields) >= 6:
+            # body may itself contain NULs -> rejoin the tail
+            records.append(
+                (
+                    fields[0],
+                    fields[1],
+                    fields[2],
+                    fields[3],
+                    fields[4],
+                    "\x00".join(fields[5:]),
+                )
+            )
+    return records
+
+
+def _resolve_merge_base(base: str, head: str) -> str:
+    """Fetch endpoints and return merge-base(base, head). Raise on failure."""
+    subprocess.run(
+        ["git", "fetch", "--quiet", "--depth=1000", "origin", head, base],
+        check=False,
+    )
+    rc, mb = _git("merge-base", base, head)
+    if rc != 0 or not mb.strip():
+        # Diverged further than the shallow window — get full history, retry.
+        subprocess.run(
+            ["git", "fetch", "--quiet", "--unshallow", "origin"], check=False
+        )
+        subprocess.run(
+            ["git", "fetch", "--quiet", "origin", head, base], check=False
+        )
+        rc, mb = _git("merge-base", base, head)
+    if rc != 0 or not mb.strip():
+        raise RuntimeError("could not resolve the PR commit range")
+    return mb.strip()
+
+
+def _pr_context():
+    """In PR CI: return (records, base_pyproject_text). None if not PR CI.
+
+    Raises RuntimeError on an unresolvable range (caller fails closed).
+    """
     event_path = os.environ.get("GITHUB_EVENT_PATH")
     if not (event_path and os.path.exists(event_path)):
         return None
@@ -98,73 +163,60 @@ def _pr_range_records():
             payload = json.load(fh)
     except (OSError, ValueError):
         return None
-    pr = payload.get("pull_request")
-    if not pr:
+    pr = payload.get("pull_request") if isinstance(payload, dict) else None
+    if not isinstance(pr, dict):
         return None
-    base = pr.get("base", {}).get("sha")
-    head = pr.get("head", {}).get("sha")
+    base = (pr.get("base") or {}).get("sha")
+    head = (pr.get("head") or {}).get("sha")
     if not (base and head):
         return None
-    # CI checkouts are shallow; fetch the two endpoints (public repo -> anon ok).
-    subprocess.run(
-        ["git", "fetch", "--quiet", "--depth=500", "origin", head], check=False
-    )
-    subprocess.run(
-        ["git", "fetch", "--quiet", "--depth=1", "origin", base], check=False
-    )
-    raw = git(
+    merge_base = _resolve_merge_base(base, head)  # may raise -> fail closed
+    rc, raw = _git(
         "log",
-        f"{base}..{head}",
+        f"{merge_base}..{head}",
         "--format=%H%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x1e",
     )
-    if not raw.strip():
-        # Could not determine the range (e.g. fetch hiccup). Don't hard-fail CI
-        # on infrastructure; the local hook and a re-run still cover it.
-        print(
-            "author-identity: could not resolve the PR commit range; skipping "
-            "(non-fatal).",
-            file=sys.stderr,
-        )
-        return []
-    records = []
-    for chunk in raw.split("\x1e"):
-        chunk = chunk.strip("\n")
-        if not chunk:
-            continue
-        fields = chunk.split("\x00")
-        if len(fields) >= 6:
-            records.append(
-                (
-                    fields[0],
-                    fields[1],
-                    fields[2],
-                    fields[3],
-                    fields[4],
-                    fields[5],
-                )
-            )
-    return records
+    if rc != 0:
+        raise RuntimeError("git log failed for the PR commit range")
+    _, base_pyproject = _git("show", f"{base}:pyproject.toml")
+    return _parse_log(raw), base_pyproject
 
 
-def _pending_record():
-    """The identity of the commit about to be created (local pre-commit stage)."""
+def _pending_records() -> list[tuple]:
+    """Identity of the commit about to be created (local pre-commit stage)."""
 
     def parse(ident: str):
         m = re.match(r"^(.*)<([^>]+)>", ident)
         return (m.group(1).strip(), m.group(2).strip()) if m else ("", "")
 
-    an, ae = parse(git("var", "GIT_AUTHOR_IDENT"))
-    cn, ce = parse(git("var", "GIT_COMMITTER_IDENT"))
+    an, ae = parse(_git("var", "GIT_AUTHOR_IDENT")[1])
+    cn, ce = parse(_git("var", "GIT_COMMITTER_IDENT")[1])
     return [("pending00", an, ae, cn, ce, "")]
 
 
 def main() -> int:
-    declared = load_declared_identities()
+    try:
+        ctx = _pr_context()
+    except RuntimeError as exc:
+        # Fail CLOSED: never silently pass a required check we couldn't run.
+        print(f"author-identity: {exc}; failing closed.", file=sys.stderr)
+        return 1
+
+    if ctx is not None:
+        records, pyproject_text = ctx
+        declared = parse_identities(pyproject_text)
+    else:
+        try:
+            declared = parse_identities(
+                Path("pyproject.toml").read_text(encoding="utf-8")
+            )
+        except OSError:
+            declared = {}
+        records = _pending_records()
+
     if not declared:
         return 0
-    records = _pr_range_records()
-    if records is None:
-        records = _pending_record()
+
     errors = []
     for rec in records:
         errors.extend(_check(rec, declared))
@@ -172,10 +224,11 @@ def main() -> int:
         print("Author identity check failed:\n", file=sys.stderr)
         print("\n".join(errors), file=sys.stderr)
         print(
-            "\nA commit is attributed to a declared author but uses a different "
-            "email.\nRe-author it with its declared identity, for example:\n"
+            "\nA commit is attributed to a declared author but uses a personal "
+            "(non-noreply) address.\nUse your GitHub `@users.noreply.github.com` "
+            "address, e.g. re-author with:\n"
             "  git commit --amend --reset-author        # latest commit\n"
-            "and make sure your git user.email matches the declared identity.",
+            "and ensure your git user.email is your noreply address.",
             file=sys.stderr,
         )
         return 1
