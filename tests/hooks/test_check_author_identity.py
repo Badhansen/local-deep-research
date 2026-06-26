@@ -5,7 +5,10 @@ GitHub noreply addresses; no real personal email appears in this file.
 """
 
 import importlib.util
+import json
 from pathlib import Path
+
+import pytest
 
 # Load the hook module by path (hyphenated filename isn't importable directly).
 _HOOK_PATH = (
@@ -155,7 +158,9 @@ class TestParseLog:
         body = "head\x00more\n\nCo-authored-by: LearningCircuit <bad@nope.test>"
         raw = f"sha1\x00An\x00a@x.test\x00Cn\x00c@x.test\x00{body}\x1e"
         recs = mod._parse_log(raw)
-        assert recs[0][5] == body  # full body kept (old fields[5] would truncate)
+        assert (
+            recs[0][5] == body
+        )  # full body kept (old fields[5] would truncate)
         errs = mod._check(recs[0], DECLARED)
         assert any("Co-authored-by" in e for e in errs)
 
@@ -218,3 +223,184 @@ class TestCheck:
         )
         assert errs
         assert all(secret not in e for e in errs)
+
+
+@pytest.fixture
+def clean_ci_env(monkeypatch):
+    """Isolate the GitHub Actions env (set in real CI -> would flake otherwise)."""
+    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    return monkeypatch
+
+
+class TestParseLogFailClosed:
+    def test_malformed_record_raises(self):
+        # An injected record separator splits a record into a <6-field chunk.
+        raw = "s\x00An\x00a@x.test\x00Cn\x00c@x.test\x00body\x1eINJECTED\x1e"
+        with pytest.raises(RuntimeError):
+            mod._parse_log(raw)
+
+    def test_multiple_records(self):
+        raw = (
+            "s1\x00A\x00a@x.test\x00C\x00c@x.test\x00b1\x1e"
+            "s2\x00A\x00a@x.test\x00C\x00c@x.test\x00b2\x1e"
+        )
+        assert [r[0] for r in mod._parse_log(raw)] == ["s1", "s2"]
+
+
+class TestResolveMergeBase:
+    def test_returns_merge_base(self, monkeypatch):
+        monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_git", lambda *a: (0, "abc1234\n"))
+        assert mod._resolve_merge_base("b", "h") == "abc1234"
+
+    def test_retries_unshallow_then_succeeds(self, monkeypatch):
+        runs = []
+        monkeypatch.setattr(
+            mod.subprocess, "run", lambda *a, **k: runs.append(a[0])
+        )
+        seq = iter([(1, ""), (0, "abc1234\n")])
+        monkeypatch.setattr(mod, "_git", lambda *a: next(seq))
+        assert mod._resolve_merge_base("b", "h") == "abc1234"
+        assert any("--unshallow" in r for r in runs)  # retry path taken
+
+    def test_raises_when_unresolvable(self, monkeypatch):
+        monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_git", lambda *a: (1, ""))
+        with pytest.raises(RuntimeError):
+            mod._resolve_merge_base("b", "h")
+
+
+class TestPrContext:
+    @staticmethod
+    def _event(tmp_path):
+        ev = tmp_path / "event.json"
+        ev.write_text(
+            json.dumps(
+                {
+                    "pull_request": {
+                        "base": {"sha": "BASE"},
+                        "head": {"sha": "HEAD"},
+                    }
+                }
+            )
+        )
+        return ev
+
+    def test_reads_allowlist_and_range_from_base(self, clean_ci_env, tmp_path):
+        mp = clean_ci_env
+        mp.setenv("GITHUB_EVENT_NAME", "pull_request")
+        mp.setenv("GITHUB_EVENT_PATH", str(self._event(tmp_path)))
+        mp.setattr(mod, "_resolve_merge_base", lambda b, h: "MB")
+        calls = []
+
+        def fake_git(*a):
+            calls.append(a)
+            if a[0] == "log":
+                return (0, "s\x00n\x00e@x.test\x00n\x00e@x.test\x00b\x1e")
+            if a[0] == "show":
+                return (0, PYPROJECT)
+            return (0, "")
+
+        mp.setattr(mod, "_git", fake_git)
+        records, text = mod._pr_context()
+        assert ("show", "BASE:pyproject.toml") in calls  # base, not work-tree
+        assert any(c[0] == "log" and "MB..HEAD" in c[1] for c in calls)
+        assert text == PYPROJECT
+        assert records and records[0][0] == "s"
+
+    def test_base_pyproject_read_fails_closed(self, clean_ci_env, tmp_path):
+        mp = clean_ci_env
+        mp.setenv("GITHUB_EVENT_NAME", "pull_request")
+        mp.setenv("GITHUB_EVENT_PATH", str(self._event(tmp_path)))
+        mp.setattr(mod, "_resolve_merge_base", lambda b, h: "MB")
+
+        def fake_git(*a):
+            if a[0] == "log":
+                return (0, "s\x00n\x00e@x.test\x00n\x00e@x.test\x00b\x1e")
+            if a[0] == "show":
+                return (1, "")  # base pyproject read fails
+            return (0, "")
+
+        mp.setattr(mod, "_git", fake_git)
+        with pytest.raises(RuntimeError):
+            mod._pr_context()
+
+    def test_non_pr_event_returns_none(self, clean_ci_env):
+        # No event + not a PR event -> local mode (None), not fail-closed.
+        assert mod._pr_context() is None
+
+    def test_pr_event_without_payload_fails_closed(self, clean_ci_env):
+        clean_ci_env.setenv("GITHUB_EVENT_NAME", "pull_request")
+        with pytest.raises(RuntimeError):
+            mod._pr_context()
+
+
+class TestMain:
+    def test_fails_closed_on_unresolvable_range(self, monkeypatch, capsys):
+        def boom():
+            raise RuntimeError("could not resolve the PR commit range")
+
+        monkeypatch.setattr(mod, "_pr_context", boom)
+        assert mod.main() == 1
+        assert "failing closed" in capsys.readouterr().err
+
+    def test_violation_in_pr_range_returns_1(self, monkeypatch, capsys):
+        rec = (
+            "deadbeef0",
+            "LearningCircuit",
+            "bad@nope.test",
+            "C",
+            "c@x.test",
+            "",
+        )
+        monkeypatch.setattr(mod, "_pr_context", lambda: ([rec], PYPROJECT))
+        assert mod.main() == 1
+        err = capsys.readouterr().err
+        assert "LearningCircuit" in err
+        assert "bad@nope.test" not in err  # offending email never printed
+
+    def test_clean_pr_range_returns_0(self, monkeypatch):
+        good = "185559241+learningcircuit@users.noreply.github.com"
+        rec = (
+            "deadbeef0",
+            "LearningCircuit",
+            good,
+            "LearningCircuit",
+            good,
+            "",
+        )
+        monkeypatch.setattr(mod, "_pr_context", lambda: ([rec], PYPROJECT))
+        assert mod.main() == 0
+
+    def test_no_declared_authors_returns_0(self, monkeypatch):
+        rec = (
+            "deadbeef0",
+            "LearningCircuit",
+            "bad@nope.test",
+            "C",
+            "c@x.test",
+            "",
+        )
+        monkeypatch.setattr(
+            mod, "_pr_context", lambda: ([rec], '[project]\nname = "x"\n')
+        )
+        assert mod.main() == 0
+
+
+class TestPendingRecords:
+    def test_parses_git_idents(self, monkeypatch):
+        ident = "LearningCircuit <bad@nope.test> 1700000000 +0000"
+        monkeypatch.setattr(mod, "_git", lambda *a: (0, ident))
+        recs = mod._pending_records()
+        assert recs[0][1] == "LearningCircuit"
+        assert recs[0][2] == "bad@nope.test"
+
+
+class TestAnchorBoundary:
+    def test_authors_prefixed_key_not_hijacked(self):
+        text = (
+            'authors_extra = [{name = "E", email = "evil@x.test"}]\n'
+            'authors = [\n    {name = "A", email = "a@b.test"},\n]\n'
+        )
+        assert mod.parse_identities(text) == {"a": {"a@b.test"}}

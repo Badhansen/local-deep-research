@@ -114,18 +114,22 @@ def _parse_log(raw: str) -> list[tuple]:
         if not chunk:
             continue
         fields = chunk.split("\x00")
-        if len(fields) >= 6:
-            # body may itself contain NULs -> rejoin the tail
-            records.append(
-                (
-                    fields[0],
-                    fields[1],
-                    fields[2],
-                    fields[3],
-                    fields[4],
-                    "\x00".join(fields[5:]),
-                )
+        if len(fields) < 6:
+            # A control char (\x1e / \x00) injected into the author/committer
+            # name or body corrupts the framing. Never silently skip a commit
+            # -> fail closed.
+            raise RuntimeError("malformed commit record in git log output")
+        # body may itself contain NULs -> rejoin the tail
+        records.append(
+            (
+                fields[0],
+                fields[1],
+                fields[2],
+                fields[3],
+                fields[4],
+                "\x00".join(fields[5:]),
             )
+        )
     return records
 
 
@@ -155,21 +159,33 @@ def _pr_context():
 
     Raises RuntimeError on an unresolvable range (caller fails closed).
     """
+    is_pr_event = os.environ.get("GITHUB_EVENT_NAME", "") in (
+        "pull_request",
+        "pull_request_target",
+    )
+
+    def give_up(reason: str):
+        # On a genuine PR event an unusable payload must FAIL CLOSED, never drop
+        # to the local no-op path. Off a PR event, this simply isn't PR CI.
+        if is_pr_event:
+            raise RuntimeError(reason)
+        return
+
     event_path = os.environ.get("GITHUB_EVENT_PATH")
     if not (event_path and os.path.exists(event_path)):
-        return None
+        return give_up("pull_request event but no event payload")
     try:
         with open(event_path, encoding="utf-8") as fh:
             payload = json.load(fh)
     except (OSError, ValueError):
-        return None
+        return give_up("could not read the PR event payload")
     pr = payload.get("pull_request") if isinstance(payload, dict) else None
     if not isinstance(pr, dict):
-        return None
+        return give_up("pull_request event missing its payload")
     base = (pr.get("base") or {}).get("sha")
     head = (pr.get("head") or {}).get("sha")
     if not (base and head):
-        return None
+        return give_up("pull_request event missing base/head sha")
     merge_base = _resolve_merge_base(base, head)  # may raise -> fail closed
     rc, raw = _git(
         "log",
@@ -178,7 +194,9 @@ def _pr_context():
     )
     if rc != 0:
         raise RuntimeError("git log failed for the PR commit range")
-    _, base_pyproject = _git("show", f"{base}:pyproject.toml")
+    rc, base_pyproject = _git("show", f"{base}:pyproject.toml")
+    if rc != 0:
+        raise RuntimeError("could not read pyproject.toml from the base ref")
     return _parse_log(raw), base_pyproject
 
 
